@@ -11,6 +11,7 @@ import Foundation
 import Network
 import Security
 import UIKit
+import Darwin
 
 // MARK: - password
 
@@ -804,20 +805,45 @@ final class WebServer: ObservableObject {
     private func pumpChunked(_ connection: NWConnection, fd: Int32) {
         let cap = 128 * 1024
         var buffer = [UInt8](repeating: 0, count: cap)
-        let n = buffer.withUnsafeMutableBytes { read(fd, $0.baseAddress, cap) }
+
+        let n = buffer.withUnsafeMutableBytes { rawBuffer in
+            Darwin.read(fd, rawBuffer.baseAddress, rawBuffer.count)
+        }
+
         if n > 0 {
             var out = Data(String(format: "%lX\r\n", n).utf8)
             out.append(contentsOf: buffer[0..<n])
-            out.append(0x0d); out.append(0x0a)
-            connection.send(content: out, completion: .contentProcessed { [weak self] error in
-                if error != nil { close(fd); connection.cancel(); return }
-                self?.queue.async { self?.pumpChunked(connection, fd: fd) }
+            out.append(0x0d)
+            out.append(0x0a)
+
+            connection.send(content: out, completion: .contentProcessed {
+                [weak self] error in
+
+                if error != nil {
+                    close(fd)
+                    connection.cancel()
+                    return
+                }
+
+                self?.queue.async {
+                    self?.pumpChunked(connection, fd: fd)
+                }
             })
+
         } else {
             close(fd)
-            connection.send(content: Data("0\r\n\r\n".utf8), completion: .contentProcessed { _ in
+
+            if n == 0 {
+                connection.send(
+                    content: Data("0\r\n\r\n".utf8),
+                    completion: .contentProcessed { _ in
+                        connection.cancel()
+                    }
+                )
+            } else {
+                print("[export-stream] read failed: \(errno)")
                 connection.cancel()
-            })
+            }
         }
     }
 
