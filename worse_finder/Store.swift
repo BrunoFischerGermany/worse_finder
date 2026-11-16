@@ -63,6 +63,10 @@ final class Store: ObservableObject {
     @Published private(set) var scanning = false
     @Published private(set) var status = ""
 
+    /// Set when a scan is requested while one is already running (e.g. an
+    /// /import arriving mid-scan). Honoured once the current scan finishes.
+    private var rescanPending = false
+
     private let queue = DispatchQueue(label: "worse_finder.scan", qos: .userInitiated)
     private let appParent = "/private/var/mobile/Containers/Data/Application"
     private let daemonParent = "/private/var/mobile/Containers/Data/InternalDaemon"
@@ -75,8 +79,17 @@ final class Store: ObservableObject {
         }
     }
 
+    /// Entry point: always hops to the main actor so `scanning`/`status`
+    /// (both `@Published`) are only ever touched there. `/import` fires this
+    /// from the HTTP queue, so without the hop we'd race SwiftUI.
     func scan() {
-        guard !scanning else { return }
+        DispatchQueue.main.async { self.beginScan() }
+    }
+
+    private func beginScan() {
+        // A scan is already running — don't drop this request (an /import that
+        // lands mid-scan would otherwise never reach the list). Queue one up.
+        guard !scanning else { rescanPending = true; return }
         scanning = true
         status = "scanning containers…"
 
@@ -135,10 +148,15 @@ final class Store: ObservableObject {
                             groupMap[identifier] = path
                         }
                     }
-                    groups = groupMap
-                        .filter { Store.reachable($0.value, group: group) }
-                        .map { GroupContainer(identifier: $0.key, path: $0.value) }
-                        .sorted { $0.identifier < $1.identifier }
+                    let candidates = groupMap.map { GroupContainer(identifier: $0.key, path: $0.value) }
+                    let reachableGroups = candidates.filter { Store.reachable($0.path, group: group) }
+                    let droppedGroups = candidates.count - reachableGroups.count
+                    if droppedGroups > 0 {
+                        // Silent until now: an imported AppGroup path that the
+                        // sandbox grant can't reach was dropped without a trace.
+                        print("[scan] \(bundleID): \(droppedGroups)/\(candidates.count) group paths unreachable, dropped")
+                    }
+                    groups = reachableGroups.sorted { $0.identifier < $1.identifier }
                 } else {
                     system = true   // unidentified containers are never user apps
                 }
@@ -373,6 +391,7 @@ final class Store: ObservableObject {
             if let data = try? JSONEncoder().encode(entries) {
                 UserDefaults.standard.set(data, forKey: appsCacheKey)
             }
+            self.runPendingRescan()
         }
     }
 
@@ -380,7 +399,16 @@ final class Store: ObservableObject {
         DispatchQueue.main.async {
             self.status = message
             self.scanning = false
+            self.runPendingRescan()
         }
+    }
+
+    /// Main-thread only. Fires a queued rescan if one was requested while the
+    /// just-finished scan was running.
+    private func runPendingRescan() {
+        guard rescanPending else { return }
+        rescanPending = false
+        beginScan()
     }
 }
 
