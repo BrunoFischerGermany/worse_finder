@@ -52,6 +52,7 @@ struct ContentView: View {
         }
         .task {
             server.appsProvider = { store.apps }
+            server.onImport = { store.scan() }
             if store.apps.isEmpty { store.scan() }
             if CommandLine.arguments.contains("--serve") {
                 server.start()

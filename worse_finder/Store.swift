@@ -100,6 +100,11 @@ final class Store: ObservableObject {
 
             var containers = Set(mapped.keys)
             containers.formUnion(scanned)
+            // Data containers the USB import knows about: covers anything the
+            // on-device pathleak missed, and lets imported-only apps show up.
+            for app in ImportStore.shared.allApps().values {
+                if let imported = app.container { containers.insert(imported) }
+            }
 
             var entries: [AppEntry] = []
             var resolved: [String: String] = [:]
@@ -109,6 +114,11 @@ final class Store: ObservableObject {
                 if bundleID == nil {
                     bundleID = self.identifierFromFilesystem(container, group: group)
                 }
+                // Authoritative container -> bundleID mapping from the USB import,
+                // when neither the store nor the filesystem gave us one.
+                if bundleID == nil {
+                    bundleID = ImportStore.shared.bundleID(forContainer: container)
+                }
 
                 var name: String?
                 var system = false
@@ -116,8 +126,17 @@ final class Store: ObservableObject {
                 if let bundleID {
                     let type = wq_ls_application_type(bundleID)
                     system = type == 1 || type == 2 || bundleID.hasPrefix("com.apple.")
-                    groups = (wq_ls_group_containers(bundleID) ?? [:])
-                        .filter { FileManager.default.fileExists(atPath: $0.value) }
+                    // What the device itself reports, plus any group paths the USB
+                    // import supplied (iOS < 27 cannot enumerate the AppGroup dir,
+                    // so third-party groups only appear via the import).
+                    var groupMap = (wq_ls_group_containers(bundleID) ?? [:])
+                    if let imported = ImportStore.shared.imported(for: bundleID) {
+                        for (identifier, path) in imported.groups where groupMap[identifier] == nil {
+                            groupMap[identifier] = path
+                        }
+                    }
+                    groups = groupMap
+                        .filter { Store.reachable($0.value, group: group) }
                         .map { GroupContainer(identifier: $0.key, path: $0.value) }
                         .sorted { $0.identifier < $1.identifier }
                 } else {
@@ -127,7 +146,9 @@ final class Store: ObservableObject {
                     if let cached = resolved[bundleID] {
                         name = cached.isEmpty ? nil : cached
                     } else {
-                        name = Self.clean(wq_ls_name(bundleID)) ?? Self.clean(storeNames[bundleID])
+                        name = Self.clean(wq_ls_name(bundleID))
+                            ?? Self.clean(storeNames[bundleID])
+                            ?? ImportStore.shared.imported(for: bundleID)?.name
                         resolved[bundleID] = name ?? ""
                     }
                 }
@@ -237,6 +258,16 @@ final class Store: ObservableObject {
 
     private static func clean(_ value: String?) -> String? {
         value.flatMap(AppEntry.sanitize)
+    }
+
+    /// A group path from the USB import may not stat until the sandbox extension
+    /// is granted. Try a plain check first, then a grant-backed probe.
+    static func reachable(_ path: String, group: String) -> Bool {
+        if FileManager.default.fileExists(atPath: path) { return true }
+        let handle = wq_grant(path, group, false)
+        guard handle >= 0 else { return false }
+        defer { wq_release(handle) }
+        return FileManager.default.fileExists(atPath: path)
     }
 
     // MARK: - LaunchServices store
@@ -350,6 +381,116 @@ final class Store: ObservableObject {
             self.status = message
             self.scanning = false
         }
+    }
+}
+
+// MARK: - external import (USB container map)
+
+/// One app as reported by `pymobiledevice3 apps list` / `ideviceinstaller`.
+struct ImportedApp: Codable {
+    var container: String?            // Data container (Container or EnvironmentVariables.HOME)
+    var name: String?                 // CFBundleDisplayName / CFBundleName
+    var groups: [String: String]      // groupID -> /private/var/mobile/Containers/Shared/AppGroup/<uuid>
+}
+
+/// Holds the container map pulled over USB, where lockdownd runs unsandboxed and
+/// hands back the AppGroup UUIDs the on-device escape cannot enumerate on iOS < 27.
+/// Fed in via the server's `/import` route; persisted so it survives relaunches.
+final class ImportStore {
+    static let shared = ImportStore()
+
+    private var apps: [String: ImportedApp] = [:]   // bundleID -> app
+    private let lock = NSLock()
+
+    private var fileURL: URL {
+        let base = (try? FileManager.default.url(for: .applicationSupportDirectory,
+                                                 in: .userDomainMask, appropriateFor: nil, create: true))
+            ?? FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        return base.appendingPathComponent("imported_containers.json")
+    }
+
+    init() { load() }
+
+    var appCount: Int { lock.lock(); defer { lock.unlock() }; return apps.count }
+    var groupCount: Int { lock.lock(); defer { lock.unlock() }; return apps.values.reduce(0) { $0 + $1.groups.count } }
+
+    func imported(for bundleID: String) -> ImportedApp? {
+        lock.lock(); defer { lock.unlock() }
+        return apps[bundleID]
+    }
+
+    func allApps() -> [String: ImportedApp] {
+        lock.lock(); defer { lock.unlock() }
+        return apps
+    }
+
+    /// bundleID owning a given data-container path, if the import knows it.
+    func bundleID(forContainer path: String) -> String? {
+        let key = ImportStore.normalize(path)
+        lock.lock(); defer { lock.unlock() }
+        for (bundleID, app) in apps {
+            if let container = app.container, ImportStore.normalize(container) == key { return bundleID }
+        }
+        return nil
+    }
+
+    /// Accepts either the raw `pymobiledevice3 apps list` dump
+    /// ({ bundleID: { Container, GroupContainers, … } }) or the slim map
+    /// ({ bundleID: { groupID: path } }). Returns how much it took.
+    @discardableResult
+    func ingest(_ data: Data) -> (apps: Int, groups: Int) {
+        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return (0, 0)
+        }
+        var parsed: [String: ImportedApp] = [:]
+        for (bundleID, value) in root {
+            guard let dict = value as? [String: Any] else { continue }
+            let groups = (dict["GroupContainers"] as? [String: String])
+                ?? (value as? [String: String])   // slim format: the value *is* the group map
+                ?? [:]
+            var container = dict["Container"] as? String
+            if container == nil, let env = dict["EnvironmentVariables"] as? [String: String] {
+                container = env["HOME"] ?? env["CFFIXED_USER_HOME"]
+            }
+            let name = ImportStore.clean((dict["CFBundleDisplayName"] as? String)
+                                         ?? (dict["CFBundleName"] as? String))
+            guard !groups.isEmpty || container != nil || name != nil else { continue }
+            parsed[bundleID] = ImportedApp(container: container, name: name, groups: groups)
+        }
+        lock.lock(); apps = parsed; lock.unlock()
+        save()
+        return (parsed.count, parsed.values.reduce(0) { $0 + $1.groups.count })
+    }
+
+    func clear() {
+        lock.lock(); apps = [:]; lock.unlock()
+        try? FileManager.default.removeItem(at: fileURL)
+    }
+
+    private func load() {
+        guard let data = try? Data(contentsOf: fileURL),
+              let decoded = try? JSONDecoder().decode([String: ImportedApp].self, from: data) else { return }
+        apps = decoded
+    }
+
+    private func save() {
+        lock.lock(); let snapshot = apps; lock.unlock()
+        guard let data = try? JSONEncoder().encode(snapshot) else { return }
+        try? data.write(to: fileURL)
+    }
+
+    private static func normalize(_ path: String) -> String {
+        path.hasPrefix("/private/") ? String(path.dropFirst(8)) : path
+    }
+
+    /// Names from the store carry bidi/formatting marks (WhatsApp ships a ‎).
+    private static func clean(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let trimmed = value
+            .replacingOccurrences(of: "\u{200e}", with: "")
+            .replacingOccurrences(of: "\u{200f}", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 }
 

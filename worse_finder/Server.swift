@@ -275,6 +275,8 @@ final class WebServer: ObservableObject {
     private let auth = AuthState()
 
     var appsProvider: (() -> [AppEntry])?
+    /// Called after a successful /import so the store can rescan with the new map.
+    var onImport: (() -> Void)?
 
     init() {
         password = ServerPassword.current()
@@ -382,15 +384,21 @@ final class WebServer: ObservableObject {
             }
 
             let head = String(decoding: buffer[..<range.lowerBound], as: UTF8.self)
+            // The import route carries a JSON container map; everything else is
+            // tiny (a login form), so keep the strict cap for those.
+            let firstLine = head.split(separator: "\r\n").first.map(String.init) ?? ""
+            let isImport = firstLine.hasPrefix("POST /import ")
+            let maxBody = isImport ? 16 * 1024 * 1024 : 1024
+            let maxBuffer = isImport ? 17 * 1024 * 1024 : 64 * 1024
             let length = self.contentLength(head) ?? 0
-            if length < 0 || length > 1024 {
+            if length < 0 || length > maxBody {
                 slot.close()
                 self.send(connection, status: "400 Bad Request", body: Data("bad request".utf8))
                 return
             }
             let bodyStart = range.upperBound
             if buffer.distance(from: bodyStart, to: buffer.endIndex) < length {
-                if isComplete || error != nil || buffer.count > 64 * 1024 {
+                if isComplete || error != nil || buffer.count > maxBuffer {
                     slot.close()
                     connection.cancel()
                     return
@@ -420,6 +428,20 @@ final class WebServer: ObservableObject {
         if method == "POST" && path == "/login" {
             let submitted = formFields(body)["k"] ?? ""
             finish(connection, path: "/login", verdict: auth.verify(presented: submitted), login: true)
+            return
+        }
+        // Accept the USB container map (raw JSON body). Same auth as every page.
+        if method == "POST" && path == "/import" {
+            let verdict = auth.verify(presented: cookieJar(head)["wq"])
+            guard case .ok = verdict else {
+                finish(connection, path: path, verdict: verdict, login: false)
+                return
+            }
+            let result = ImportStore.shared.ingest(body)
+            note("import: \(result.apps) apps, \(result.groups) group paths")
+            onImport?()
+            send(connection, status: "200 OK",
+                 body: Data("imported \(result.apps) apps, \(result.groups) group paths — rescanning\n".utf8))
             return
         }
         guard method == "GET" else {
@@ -457,6 +479,12 @@ final class WebServer: ObservableObject {
         case "i":
             guard segments.count > 1 else { send(connection, status: "404 Not Found", body: Data()); return }
             sendIcon(connection, bundleID: segments[1])
+        case "import":
+            sendImportPage(connection)
+        case "all":
+            // One streamed ZIP of every reachable container, on the fly.
+            sendZipStream(connection, roots: allRoots(),
+                          filename: "worse_finder-all-\(Fmt.stamp()).zip")
         case "a", "f", "z":
             guard segments.count > 1 else { send(connection, status: "404 Not Found", body: Data()); return }
             let container = appContainer(for: segments[1])
@@ -469,7 +497,8 @@ final class WebServer: ObservableObject {
             switch segments[0] {
             case "a": sendListing(connection, container: container, relative: relative, group: group)
             case "f": sendFile(connection, container: container, relative: relative, group: group)
-            default: sendZip(connection, container: container)
+            default: sendZipStream(connection, roots: [(container, "")],
+                                   filename: safeFilename(appContainerName(container)) + "-\(Fmt.stamp()).zip")
             }
         default:
             send(connection, status: "404 Not Found", body: Data("not found".utf8))
@@ -542,6 +571,7 @@ final class WebServer: ObservableObject {
         }
         let body = """
         <h1>\(apps.count) apps</h1>
+        <div class=actions><a class=btn href="/all">Download all</a> <a class=btn href="/import">Import map</a></div>
         <div class=list>\(rows)</div>
         """
         send(connection, status: "200 OK", type: "text/html; charset=utf-8",
@@ -717,6 +747,176 @@ final class WebServer: ObservableObject {
         stream.open()
         // The archive is a temporary copy: drop it once it has been served.
         pump(connection, stream: stream, handle: 0, cleanup: url.deletingLastPathComponent())
+    }
+
+    // MARK: streaming export (on the fly, no temp file)
+
+    /// Streams a ZIP built from one or more container roots straight down the
+    /// connection via chunked transfer, so nothing is staged on disk first.
+    private func sendZipStream(_ connection: NWConnection,
+                               roots: [(path: String, prefix: String)],
+                               filename: String) {
+        guard wq_app_group() != nil else {
+            send(connection, status: "500 Internal Server Error", body: Data("no app group".utf8))
+            return
+        }
+        var fds: [Int32] = [0, 0]
+        guard pipe(&fds) == 0 else {
+            send(connection, status: "500 Internal Server Error", body: Data("pipe failed".utf8))
+            return
+        }
+        let readFD = fds[0]
+        let writeFD = fds[1]
+
+        // Build on a background thread; the pipe gives natural back-pressure —
+        // the writer blocks whenever the reader has not drained it yet.
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self, let group = wq_app_group(),
+                  let writer = ZipWriter.streamingWriter(toFileDescriptor: writeFD) else {
+                close(writeFD)
+                return
+            }
+            var files = 0
+            for root in roots {
+                files += self.streamRoot(root.path, prefix: root.prefix, group: group, writer: writer)
+            }
+            _ = writer.close()   // closes writeFD → EOF for the reader
+            print("[export-stream] \(filename) roots=\(roots.count) files=\(files) skipped=\(writer.filesSkipped)")
+        }
+
+        let head = """
+        HTTP/1.1 200 OK\r
+        Content-Type: application/zip\r
+        Content-Disposition: attachment; filename="\(filename)"\r
+        Transfer-Encoding: chunked\r
+        Connection: close\r
+        \r
+
+        """
+        connection.send(content: Data(head.utf8), completion: .contentProcessed { [weak self] error in
+            if error != nil { close(readFD); connection.cancel(); return }
+            self?.queue.async { self?.pumpChunked(connection, fd: readFD) }
+        })
+    }
+
+    /// Reads one block from the pipe and sends it as a chunk; the next read only
+    /// happens once the send completes, which paces the whole transfer.
+    private func pumpChunked(_ connection: NWConnection, fd: Int32) {
+        let cap = 128 * 1024
+        var buffer = [UInt8](repeating: 0, count: cap)
+        let n = buffer.withUnsafeMutableBytes { read(fd, $0.baseAddress, cap) }
+        if n > 0 {
+            var out = Data(String(format: "%lX\r\n", n).utf8)
+            out.append(contentsOf: buffer[0..<n])
+            out.append(0x0d); out.append(0x0a)
+            connection.send(content: out, completion: .contentProcessed { [weak self] error in
+                if error != nil { close(fd); connection.cancel(); return }
+                self?.queue.async { self?.pumpChunked(connection, fd: fd) }
+            })
+        } else {
+            close(fd)
+            connection.send(content: Data("0\r\n\r\n".utf8), completion: .contentProcessed { _ in
+                connection.cancel()
+            })
+        }
+    }
+
+    /// Walks one container into the writer, prefixing archive entries. Unreadable
+    /// or special files are skipped so one bad file never stops the stream.
+    @discardableResult
+    private func streamRoot(_ container: String, prefix: String, group: String, writer: ZipWriter) -> Int {
+        let handle = wq_grant(container, group, false)
+        guard handle >= 0 else { return 0 }
+        defer { wq_release(handle) }
+
+        func normalize(_ path: String) -> String {
+            path.hasPrefix("/private/") ? String(path.dropFirst(8)) : path
+        }
+        let base = normalize(container)
+
+        let root = URL(fileURLWithPath: container)
+        guard let enumerator = FileManager.default.enumerator(
+            at: root,
+            includingPropertiesForKeys: [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey],
+            options: [],
+            errorHandler: { _, _ in true }) else { return 0 }
+
+        var files = 0
+        for case let url as URL in enumerator {
+            var relative = normalize(url.path)
+            if relative.hasPrefix(base) { relative = String(relative.dropFirst(base.count)) }
+            relative = relative.hasPrefix("/") ? String(relative.dropFirst()) : relative
+            guard !relative.isEmpty else { continue }
+            let entry = prefix.isEmpty ? relative : prefix + "/" + relative
+
+            var info = stat()
+            guard lstat(url.path, &info) == 0 else { continue }
+            let kind = info.st_mode & S_IFMT
+            if kind == S_IFLNK { continue }
+            if kind == S_IFDIR { _ = writer.addDirectory(entry); continue }
+            guard kind == S_IFREG else { continue }
+            if writer.addFile(url.path, entry: entry) { files += 1 }
+        }
+        return files
+    }
+
+    /// Every reachable container (app data, earlier installs, app groups), deduped
+    /// by path, each with a readable archive prefix. Skips our own container.
+    private func allRoots() -> [(path: String, prefix: String)] {
+        var roots: [(path: String, prefix: String)] = []
+        var seen = Set<String>()
+        let own = Bundle.main.bundleIdentifier
+        for app in appsProvider?() ?? [] {
+            if let identifier = app.bundleID, identifier == own { continue }
+            let label = safeFilename(app.bundleID ?? app.container.lastPathComponent)
+            if seen.insert(app.container).inserted {
+                roots.append((app.container, "apps/\(label)/Data"))
+            }
+            for alternate in app.alternates where seen.insert(alternate).inserted {
+                roots.append((alternate, "apps/\(label)/Data-\(alternate.lastPathComponent)"))
+            }
+            for group in app.groups where seen.insert(group.path).inserted {
+                roots.append((group.path, "groups/\(safeFilename(group.identifier))"))
+            }
+        }
+        return roots
+    }
+
+    private func safeFilename(_ name: String) -> String {
+        let cleaned = name
+            .replacingOccurrences(of: "/", with: "-")
+            .replacingOccurrences(of: "\"", with: "")
+            .replacingOccurrences(of: "\\", with: "-")
+            .replacingOccurrences(of: "\r", with: "")
+            .replacingOccurrences(of: "\n", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return cleaned.isEmpty ? "container" : cleaned
+    }
+
+    private func sendImportPage(_ connection: NWConnection) {
+        let body = """
+        <h1>Import container map</h1>
+        <p>Upload the JSON from <code>pymobiledevice3 apps list</code> (or a slim
+        <code>{ bundleID: { groupID: path } }</code> map). It fills in the App Group
+        containers that iOS &lt; 27 cannot enumerate on-device.</p>
+        <input type=file id=f accept="application/json,.json">
+        <div class=actions><button onclick="up()">Import &amp; rescan</button></div>
+        <pre id=out style="white-space:pre-wrap;color:#9aa4b2"></pre>
+        <script>
+        async function up(){
+          var el=document.getElementById('f');
+          if(!el.files.length){return}
+          var out=document.getElementById('out');
+          out.textContent='uploading…';
+          try{
+            var r=await fetch('/import',{method:'POST',body:await el.files[0].text()});
+            out.textContent=await r.text();
+          }catch(e){ out.textContent='failed: '+e; }
+        }
+        </script>
+        """
+        send(connection, status: "200 OK", type: "text/html; charset=utf-8",
+             body: Data(page("Import", body, home: true).utf8))
     }
 
     private func sendIcon(_ connection: NWConnection, bundleID: String) {
