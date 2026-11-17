@@ -465,6 +465,10 @@ static BOOL extension_is_compressed(NSString *name) {
         return NO;
     }
 
+    // The payload advances the offset too — without this, every central-directory
+    // offset after the first file is wrong and the archive fails integrity checks.
+    _offset += csize;
+
     // Data descriptor: signature, crc, compressed, uncompressed (32-bit each).
     put32(_fp, 0x08074b50);
     put32(_fp, crc);

@@ -977,17 +977,22 @@ final class WebServer: ObservableObject {
     private func allRoots() -> [(path: String, prefix: String)] {
         var roots: [(path: String, prefix: String)] = []
         var seen = Set<String>()
-        func add(_ path: String, _ label: String) {
-            guard !path.isEmpty, !seen.contains(path) else { return }
+        // Mirror the real device path so the archive recreates the original
+        // layout (…/Containers/Shared/AppGroup/<uuid>/…) instead of a label.
+        func add(_ path: String) {
+            guard path.hasPrefix("/"), !seen.contains(path) else { return }
             seen.insert(path)
-            roots.append((path, safeFilename(label) + "_" + path.lastPathComponent))
+            let prefix = path.hasPrefix("/private/")
+                ? String(path.dropFirst("/private/".count))
+                : String(path.dropFirst())
+            roots.append((path, prefix))
         }
         for app in appsProvider?() ?? [] {
-            add(app.container, app.displayName)
-            for alternate in app.alternates { add(alternate, app.displayName + "-earlier") }
-            for group in app.groups { add(group.path, app.displayName + "-" + group.identifier) }
+            add(app.container)
+            for alternate in app.alternates { add(alternate) }
+            for group in app.groups { add(group.path) }
         }
-        for entry in imported.all() { add(entry.path, entry.label) }
+        for entry in imported.all() { add(entry.path) }
         return roots
     }
 
