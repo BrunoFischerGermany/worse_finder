@@ -542,7 +542,23 @@ final class WebServer: ObservableObject {
         }
         let body = """
         <h1>\(apps.count) apps</h1>
+        <form class=actions onsubmit="return openPath()">
+          <input id=pp placeholder="App Group path or UUID"
+                 autocapitalize=off autocorrect=off spellcheck=false>
+          <button class=btn type=submit>Open</button>
+        </form>
         <div class=list>\(rows)</div>
+        <script>
+        function openPath(){
+          var v=document.getElementById('pp').value.trim();
+          if(!v){return false}
+          // Accept a full /private/... path or a bare UUID; the server
+          // rebuilds the AppGroup path from the trailing UUID.
+          var id=v.split('/').filter(Boolean).pop();
+          location.href='/a/'+encodeURIComponent(id);
+          return false;
+        }
+        </script>
         """
         send(connection, status: "200 OK", type: "text/html; charset=utf-8",
              body: Data(page("Apps", body, home: true).utf8))
@@ -759,7 +775,17 @@ final class WebServer: ObservableObject {
     /// The row can go stale between scan and request: a reinstall replaces the
     /// container. Fall back to whatever LaunchServices reports now.
     private func appContainer(for identifier: String) -> String? {
-        guard let entry = containerIndex()[identifier] else { return nil }
+        guard let entry = containerIndex()[identifier] else {
+            // Not in the scan. Allow browsing a pasted App Group UUID directly:
+            // the path under Shared/AppGroup is deterministic, and the sandbox
+            // grant in sendListing/sendFile/sendZip is what actually validates
+            // access. This is what lets a single path reach a container the
+            // on-device scan could not enumerate (iOS < 27).
+            if UUID(uuidString: identifier) != nil {
+                return "/private/var/mobile/Containers/Shared/AppGroup/\(identifier)"
+            }
+            return nil
+        }
         var info = stat()
         if lstat(entry.path, &info) == 0 { return entry.path }
         if let bundleID = entry.bundleID, let fresh = wq_ls_container(bundleID) {
