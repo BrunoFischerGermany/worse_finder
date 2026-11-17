@@ -352,6 +352,54 @@ final class ImportedPaths {
     }
 }
 
+/// App icons pulled over USB (pymobiledevice3) and uploaded through the Import
+/// page, stored as one PNG per bundle. On-device IconServices refuses to render
+/// third-party icons for a sandboxed client (-609), so this is how real icons
+/// get in. Each upload replaces the set.
+final class ImportedIcons {
+    private let lock = NSLock()
+
+    static var directory: URL {
+        let base = (try? FileManager.default.url(for: .applicationSupportDirectory,
+                                                 in: .userDomainMask, appropriateFor: nil, create: true))
+            ?? FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        return base.appendingPathComponent("ImportedIcons", isDirectory: true)
+    }
+
+    private static func isSafe(_ bundleID: String) -> Bool {
+        !bundleID.isEmpty && !bundleID.contains("/") && !bundleID.contains("..")
+    }
+
+    /// Accepts { bundleID: "<base64 PNG>" }. Returns how many icons it stored.
+    @discardableResult
+    func ingest(_ data: Data) -> Int {
+        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return 0 }
+        let dir = ImportedIcons.directory
+        lock.lock(); defer { lock.unlock() }
+        try? FileManager.default.removeItem(at: dir)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        var count = 0
+        for (bundleID, value) in root {
+            guard ImportedIcons.isSafe(bundleID),
+                  let encoded = value as? String,
+                  let png = Data(base64Encoded: encoded), !png.isEmpty else { continue }
+            if (try? png.write(to: dir.appendingPathComponent(bundleID + ".png"))) != nil { count += 1 }
+        }
+        return count
+    }
+
+    func count() -> Int {
+        (try? FileManager.default.contentsOfDirectory(atPath: ImportedIcons.directory.path).count) ?? 0
+    }
+
+    /// PNG bytes for a bundle, if an icon was imported. Static so the on-device
+    /// IconCache can read it too.
+    static func data(for bundleID: String) -> Data? {
+        guard isSafe(bundleID) else { return nil }
+        return try? Data(contentsOf: directory.appendingPathComponent(bundleID + ".png"))
+    }
+}
+
 final class WebServer: ObservableObject {
     @Published private(set) var running = false
     @Published private(set) var log: [String] = []
@@ -368,6 +416,7 @@ final class WebServer: ObservableObject {
     private let cacheLock = NSLock()
     private let auth = AuthState()
     private let imported = ImportedPaths()
+    private let importedIcons = ImportedIcons()
 
     var appsProvider: (() -> [AppEntry])?
 
@@ -482,8 +531,9 @@ final class WebServer: ObservableObject {
             // cap for those.
             let firstLine = head.split(separator: "\r\n").first.map(String.init) ?? ""
             let isImport = firstLine.hasPrefix("POST /import ")
-            let maxBody = isImport ? 16 * 1024 * 1024 : 1024
-            let maxBuffer = isImport ? 17 * 1024 * 1024 : 64 * 1024
+            let isIcons = firstLine.hasPrefix("POST /icons ")
+            let maxBody = isIcons ? 64 * 1024 * 1024 : (isImport ? 16 * 1024 * 1024 : 1024)
+            let maxBuffer = isIcons ? 65 * 1024 * 1024 : (isImport ? 17 * 1024 * 1024 : 64 * 1024)
             let length = self.contentLength(head) ?? 0
             if length < 0 || length > maxBody {
                 slot.close()
@@ -534,6 +584,17 @@ final class WebServer: ObservableObject {
             note("import: \(count) paths")
             send(connection, status: "200 OK",
                  body: Data("imported \(count) paths — open them from the Apps page\n".utf8))
+            return
+        }
+        // Upload of app icons ({ bundleID: base64 PNG }). Same auth as the pages.
+        if method == "POST" && path == "/icons" {
+            guard case .ok = auth.verify(presented: cookieJar(head)["wq"]) else {
+                send(connection, status: "401 Unauthorized", body: Data("auth required".utf8))
+                return
+            }
+            let count = importedIcons.ingest(body)
+            note("icons: \(count) stored")
+            send(connection, status: "200 OK", body: Data("imported \(count) icons\n".utf8))
             return
         }
         guard method == "GET" else {
@@ -709,6 +770,7 @@ final class WebServer: ObservableObject {
 
     private func sendImportPage(_ connection: NWConnection) {
         let count = imported.all().count
+        let icons = importedIcons.count()
         let body = """
         <h1>Import container map</h1>
         <p>Upload the JSON from <code>pymobiledevice3 apps list</code>, or a slim
@@ -716,20 +778,29 @@ final class WebServer: ObservableObject {
         paths that iOS &lt; 27 cannot enumerate on-device. Each upload replaces the set.</p>
         <p>\(count) path\(count == 1 ? "" : "s") currently imported.</p>
         <input type=file id=f accept="application/json,.json">
-        <div class=actions><button class=btn onclick="up()">Import</button>
-          <a class=btn href="/">Back to apps</a></div>
+        <div class=actions><button class=btn onclick="up()">Import map</button></div>
         <pre id=out style="white-space:pre-wrap;color:#9aa4b2"></pre>
+
+        <h1>Import icons</h1>
+        <p>Upload a <code>{ bundleID: "&lt;base64 PNG&gt;" }</code> file of app icons
+        pulled over USB. On-device IconServices refuses to render third-party icons
+        for this app, so this is how real icons appear. Each upload replaces the set.</p>
+        <p>\(icons) icon\(icons == 1 ? "" : "s") currently imported.</p>
+        <input type=file id=fi accept="application/json,.json">
+        <div class=actions><button class=btn onclick="upIcons()">Import icons</button>
+          <a class=btn href="/">Back to apps</a></div>
+        <pre id=outi style="white-space:pre-wrap;color:#9aa4b2"></pre>
         <script>
-        async function up(){
-          var el=document.getElementById('f');
+        async function post(url, el, out){
           if(!el.files.length){return}
-          var out=document.getElementById('out');
           out.textContent='uploading…';
           try{
-            var r=await fetch('/import',{method:'POST',body:await el.files[0].text()});
+            var r=await fetch(url,{method:'POST',body:await el.files[0].text()});
             out.textContent=await r.text();
           }catch(e){ out.textContent='failed: '+e; }
         }
+        function up(){ post('/import', document.getElementById('f'), document.getElementById('out')); }
+        function upIcons(){ post('/icons', document.getElementById('fi'), document.getElementById('outi')); }
         </script>
         """
         send(connection, status: "200 OK", type: "text/html; charset=utf-8",
@@ -1027,7 +1098,9 @@ final class WebServer: ObservableObject {
             send(connection, status: "200 OK", type: "image/png", body: cached, extra: ["Cache-Control": "max-age=86400"])
             return
         }
-        guard let data = wq_ls_icon(bundleID) else {
+        // Prefer an icon uploaded over USB; on-device IconServices refuses to
+        // render third-party icons for a sandboxed client.
+        guard let data = ImportedIcons.data(for: bundleID) ?? wq_ls_icon(bundleID) else {
             send(connection, status: "404 Not Found", body: Data())
             return
         }

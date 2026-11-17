@@ -386,7 +386,10 @@ final class IconCache: ObservableObject {
         guard images[bundleID] == nil, !loading.contains(bundleID) else { return }
         loading.insert(bundleID)
         queue.async {
-            let image = wq_app_icon(bundleID)
+            // Prefer an icon uploaded over USB; on-device IconServices refuses
+            // third-party icons for this sandboxed app.
+            let image = ImportedIcons.data(for: bundleID).flatMap(UIImage.init(data:))
+                ?? wq_app_icon(bundleID)
             DispatchQueue.main.async {
                 self.loading.remove(bundleID)
                 if let image { self.images[bundleID] = image }
