@@ -555,6 +555,10 @@ final class WebServer: ObservableObject {
             sendIcon(connection, bundleID: segments[1])
         case "import":
             sendImportPage(connection)
+        case "all":
+            // One streamed ZIP of every reachable container, on the fly.
+            sendZipStream(connection, roots: allRoots(),
+                          filename: "worse_finder-all-\(Int(Date().timeIntervalSince1970)).zip")
         case "a", "f", "z":
             guard segments.count > 1 else { send(connection, status: "404 Not Found", body: Data()); return }
             let container = appContainer(for: segments[1])
@@ -656,7 +660,8 @@ final class WebServer: ObservableObject {
         }
         let body = """
         <h1>\(apps.count) apps</h1>
-        <div class=actions><a class=btn href="/import">Import map</a></div>
+        <div class=actions><a class=btn href="/all">Download all</a>
+          <a class=btn href="/import">Import map</a></div>
         <form class=actions onsubmit="return openPath()">
           <input id=pp placeholder="App Group path or UUID"
                  autocapitalize=off autocorrect=off spellcheck=false>
@@ -962,6 +967,28 @@ final class WebServer: ObservableObject {
         let cleaned = String(name.map { allowed.contains($0) ? $0 : "_" })
             .trimmingCharacters(in: CharacterSet(charactersIn: "._"))
         return cleaned.isEmpty ? "container" : cleaned
+    }
+
+    /// Every container the server can reach: each scanned app's data container,
+    /// its earlier-install containers and its App Groups, plus every uploaded
+    /// path. Each gets a unique archive prefix (label + UUID) so files from
+    /// different containers never collide. Unreachable roots contribute nothing
+    /// — streamRoot's grant simply fails and skips them.
+    private func allRoots() -> [(path: String, prefix: String)] {
+        var roots: [(path: String, prefix: String)] = []
+        var seen = Set<String>()
+        func add(_ path: String, _ label: String) {
+            guard !path.isEmpty, !seen.contains(path) else { return }
+            seen.insert(path)
+            roots.append((path, safeFilename(label) + "_" + path.lastPathComponent))
+        }
+        for app in appsProvider?() ?? [] {
+            add(app.container, app.displayName)
+            for alternate in app.alternates { add(alternate, app.displayName + "-earlier") }
+            for group in app.groups { add(group.path, app.displayName + "-" + group.identifier) }
+        }
+        for entry in imported.all() { add(entry.path, entry.label) }
+        return roots
     }
 
     private func sendIcon(_ connection: NWConnection, bundleID: String) {
