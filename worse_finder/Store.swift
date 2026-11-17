@@ -183,6 +183,26 @@ final class Store: ObservableObject {
             let merged = extras.values.reduce(0) { $0 + $1.count }
             if merged > 0 { print("[scan] \(merged) extra live containers kept as alternates") }
 
+            // LaunchServices/store names for many system helper bundles are
+            // generic UTType descriptions ("MPEG-4 movie", "four-character code")
+            // shared across unrelated bundles. Drop any name used by more than
+            // one bundle so those fall back to the bundle identifier — the useful
+            // label. Real app names are unique and survive.
+            var bundlesByName: [String: Set<String>] = [:]
+            for entry in entries {
+                if let name = entry.name, let bundleID = entry.bundleID {
+                    bundlesByName[name, default: []].insert(bundleID)
+                }
+            }
+            var genericNames = 0
+            for index in entries.indices {
+                if let name = entries[index].name, (bundlesByName[name]?.count ?? 0) >= 2 {
+                    entries[index].name = nil
+                    genericNames += 1
+                }
+            }
+            if genericNames > 0 { print("[scan] dropped \(genericNames) generic shared names") }
+
             entries.sort {
                 $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending
             }

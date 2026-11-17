@@ -96,7 +96,12 @@ struct AppsView: View {
                 .background(.bar)
             }
             .task {
-                if store.apps.isEmpty { store.scan() }
+                // Always refresh, not just when empty: a cached container can be
+                // stale after a reinstall, and clicking it would fail with
+                // "no longer exists". A fresh scan drops dead containers and
+                // re-resolves moved ones. The cache still shows instantly; the
+                // scan guards against overlapping runs itself.
+                store.scan()
                 pushLaunchApp(store.apps)
             }
             .onChange(of: store.apps) { _, apps in
