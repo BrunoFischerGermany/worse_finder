@@ -11,6 +11,7 @@ import Foundation
 import Network
 import Security
 import UIKit
+import Darwin
 
 // MARK: - password
 
@@ -469,7 +470,8 @@ final class WebServer: ObservableObject {
             switch segments[0] {
             case "a": sendListing(connection, container: container, relative: relative, group: group)
             case "f": sendFile(connection, container: container, relative: relative, group: group)
-            default: sendZip(connection, container: container)
+            default: sendZipStream(connection, roots: [(container, "")],
+                                   filename: safeFilename(appContainerName(container)) + ".zip")
             }
         default:
             send(connection, status: "404 Not Found", body: Data("not found".utf8))
@@ -695,44 +697,128 @@ final class WebServer: ObservableObject {
         if let cleanup { try? FileManager.default.removeItem(at: cleanup) }
     }
 
-    private func sendZip(_ connection: NWConnection, container: String) {
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("http-\(UUID().uuidString)", isDirectory: true)
-        let name = appContainerName(container)
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            guard let self else { return }
-            do {
-                let result = try Exporter().run(container: container, name: name,
-                                                outputDirectory: directory) { _, _ in }
-                let archive = (try? FileManager.default.attributesOfItem(atPath: result.url.path))?[.size] as? Int64 ?? 0
-                print("[export] \(container) files=\(result.files) bytes=\(result.bytes) skipped=\(result.skipped) archive=\(archive) seconds=\(String(format: "%.1f", result.seconds))")
-                self.serveArchive(connection, url: result.url)
-            } catch {
-                self.send(connection, status: "500 Internal Server Error", type: "text/html; charset=utf-8",
-                          body: Data(self.page("Export failed", "<p>\(error.localizedDescription)</p>", home: true).utf8))
-            }
-        }
-    }
-
-    private func serveArchive(_ connection: NWConnection, url: URL) {
-        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
-              let size = attributes[.size] as? Int64,
-              let stream = InputStream(url: url) else {
-            send(connection, status: "500 Internal Server Error", body: Data())
+    /// Streams a ZIP of one or more containers straight to the socket, built on
+    /// the fly: nothing is staged on disk first. A pipe connects a background
+    /// writer to the chunked HTTP sender and gives natural back-pressure — the
+    /// writer blocks whenever the reader has not drained it yet.
+    private func sendZipStream(_ connection: NWConnection,
+                               roots: [(path: String, prefix: String)],
+                               filename: String) {
+        guard wq_app_group() != nil else {
+            send(connection, status: "500 Internal Server Error", body: Data("no app group".utf8))
             return
         }
+        var fds: [Int32] = [0, 0]
+        guard pipe(&fds) == 0 else {
+            send(connection, status: "500 Internal Server Error", body: Data("pipe failed".utf8))
+            return
+        }
+        let readFD = fds[0]
+        let writeFD = fds[1]
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self, let group = wq_app_group(),
+                  let writer = ZipWriter.streamingWriter(toFileDescriptor: writeFD) else {
+                close(writeFD)
+                return
+            }
+            var files = 0
+            for root in roots {
+                files += self.streamRoot(root.path, prefix: root.prefix, group: group, writer: writer)
+            }
+            _ = writer.close()   // closes writeFD → EOF for the reader
+            print("[export-stream] \(filename) roots=\(roots.count) files=\(files) skipped=\(writer.filesSkipped)")
+        }
+
         let head = """
         HTTP/1.1 200 OK\r
         Content-Type: application/zip\r
-        Content-Length: \(size)\r
-        Content-Disposition: attachment; filename="\(url.lastPathComponent)"\r
+        Content-Disposition: attachment; filename="\(filename)"\r
+        Transfer-Encoding: chunked\r
         Connection: close\r
         \r
 
         """
-        connection.send(content: Data(head.utf8), completion: .contentProcessed { _ in })
-        stream.open()
-        // The archive is a temporary copy: drop it once it has been served.
-        pump(connection, stream: stream, handle: 0, cleanup: url.deletingLastPathComponent())
+        connection.send(content: Data(head.utf8), completion: .contentProcessed { [weak self] error in
+            if error != nil { close(readFD); connection.cancel(); return }
+            self?.queue.async { self?.pumpChunked(connection, fd: readFD) }
+        })
+    }
+
+    /// Reads one block from the pipe and sends it as a chunk; the next read only
+    /// happens once the send completes, which paces the whole transfer.
+    private func pumpChunked(_ connection: NWConnection, fd: Int32) {
+        let cap = 128 * 1024
+        var buffer = [UInt8](repeating: 0, count: cap)
+        let n = buffer.withUnsafeMutableBytes { rawBuffer in
+            Darwin.read(fd, rawBuffer.baseAddress, rawBuffer.count)
+        }
+        if n > 0 {
+            var out = Data(String(format: "%lX\r\n", n).utf8)
+            out.append(contentsOf: buffer[0..<n])
+            out.append(0x0d); out.append(0x0a)
+            connection.send(content: out, completion: .contentProcessed { [weak self] error in
+                if error != nil { close(fd); connection.cancel(); return }
+                self?.queue.async { self?.pumpChunked(connection, fd: fd) }
+            })
+        } else {
+            close(fd)
+            if n == 0 {
+                connection.send(content: Data("0\r\n\r\n".utf8),
+                                completion: .contentProcessed { _ in connection.cancel() })
+            } else {
+                print("[export-stream] read failed: \(errno)")
+                connection.cancel()
+            }
+        }
+    }
+
+    /// Walks one container into the writer, prefixing archive entries. Unreadable
+    /// or special files are skipped so one bad file never stops the stream.
+    @discardableResult
+    private func streamRoot(_ container: String, prefix: String, group: String, writer: ZipWriter) -> Int {
+        let handle = wq_grant(container, group, false)
+        guard handle >= 0 else { return 0 }
+        defer { wq_release(handle) }
+
+        func normalize(_ path: String) -> String {
+            path.hasPrefix("/private/") ? String(path.dropFirst(8)) : path
+        }
+        let base = normalize(container)
+
+        let root = URL(fileURLWithPath: container)
+        guard let enumerator = FileManager.default.enumerator(
+            at: root,
+            includingPropertiesForKeys: [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey],
+            options: [],
+            errorHandler: { _, _ in true }) else { return 0 }
+
+        var files = 0
+        for case let url as URL in enumerator {
+            var relative = normalize(url.path)
+            if relative.hasPrefix(base) { relative = String(relative.dropFirst(base.count)) }
+            relative = relative.hasPrefix("/") ? String(relative.dropFirst()) : relative
+            guard !relative.isEmpty else { continue }
+            let entry = prefix.isEmpty ? relative : prefix + "/" + relative
+
+            var info = stat()
+            guard lstat(url.path, &info) == 0 else { continue }
+            let kind = info.st_mode & S_IFMT
+            if kind == S_IFLNK { continue }
+            if kind == S_IFDIR { _ = writer.addDirectory(entry); continue }
+            guard kind == S_IFREG else { continue }
+            if writer.addFile(url.path, entry: entry) { files += 1 }
+        }
+        return files
+    }
+
+    /// Container names carry spaces, separators and non-ASCII; reduce to a safe
+    /// ASCII filename for the Content-Disposition header.
+    private func safeFilename(_ name: String) -> String {
+        let allowed = Set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.")
+        let cleaned = String(name.map { allowed.contains($0) ? $0 : "_" })
+            .trimmingCharacters(in: CharacterSet(charactersIn: "._"))
+        return cleaned.isEmpty ? "container" : cleaned
     }
 
     private func sendIcon(_ connection: NWConnection, bundleID: String) {
