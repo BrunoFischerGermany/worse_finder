@@ -10,6 +10,7 @@
 #include <string.h>
 #include <time.h>
 #include <sys/stat.h>
+#include <fcntl.h>
 
 static const uint32_t kMax32 = 0xFFFFFFFFu;
 static const uint16_t kMax16 = 0xFFFFu;
@@ -82,10 +83,15 @@ static BOOL extension_is_compressed(NSString *name) {
     uint64_t _bytes;
     NSString *_error;
     BOOL _closed;
+    BOOL _streaming;
 }
 
 + (instancetype)writerAtPath:(NSString *)path {
     return [[self alloc] initWithPath:path];
+}
+
++ (instancetype)streamingWriterToFileDescriptor:(int)fd {
+    return [[self alloc] initWithFileDescriptor:fd];
 }
 
 - (instancetype)initWithPath:(NSString *)path {
@@ -102,6 +108,26 @@ static BOOL extension_is_compressed(NSString *name) {
     return self;
 }
 
+- (instancetype)initWithFileDescriptor:(int)fd {
+    self = [super init];
+    if (!self) return nil;
+
+    // A closed reader (browser cancelled the download) must not raise SIGPIPE
+    // and kill the app: fwrite then just returns an error we handle.
+    int on = 1;
+    fcntl(fd, F_SETNOSIGPIPE, on);
+
+    _fp = fdopen(fd, "wb");
+    if (!_fp) {
+        _error = [NSString stringWithFormat:@"cannot open fd %d: %s", fd, strerror(errno)];
+        return nil;
+    }
+    _central = [NSMutableData data];
+    _offset = 0;
+    _streaming = YES;
+    return self;
+}
+
 - (void)dealloc {
     if (_fp) fclose(_fp);
 }
@@ -115,6 +141,7 @@ static BOOL extension_is_compressed(NSString *name) {
 
 - (void)appendCentralRecord:(const char *)name
                      length:(size_t)nameLen
+                      flags:(uint16_t)flags
                      method:(uint16_t)method
                       crc:(uint32_t)crc
                 compressed:(uint64_t)csize
@@ -132,7 +159,7 @@ static BOOL extension_is_compressed(NSString *name) {
     dataPut32(_central, 0x02014b50);
     dataPut16(_central, 45);                       // version made by (4.5, MS-DOS host)
     dataPut16(_central, fields > 0 ? 45 : 20);     // version needed
-    dataPut16(_central, 0x0800);                   // UTF-8 names
+    dataPut16(_central, flags);                    // general purpose (UTF-8, maybe bit 3)
     dataPut16(_central, method);
     dataPut16(_central, dtime);
     dataPut16(_central, ddate);
@@ -184,7 +211,7 @@ static BOOL extension_is_compressed(NSString *name) {
     fwrite(cname, 1, nameLen, _fp);
 
     _offset += 30 + nameLen;
-    [self appendCentralRecord:cname length:nameLen method:0 crc:0 compressed:0
+    [self appendCentralRecord:cname length:nameLen flags:0x0800 method:0 crc:0 compressed:0
                  uncompressed:0 offset:headerOffset time:dtime date:ddate dir:YES];
     _entries++;
     return YES;
@@ -219,6 +246,13 @@ static BOOL extension_is_compressed(NSString *name) {
     uint16_t extraLen = bigLocal ? 20 : 0;
     uint16_t dtime, ddate;
     dos_stamp(st.st_mtime, &dtime, &ddate);
+
+    if (_streaming) {
+        BOOL ok = [self streamFile:in name:cname length:nameLen usize:usize
+                            method:method store:store time:dtime date:ddate entry:entry];
+        fclose(in);
+        return ok;
+    }
 
     uint64_t headerOffset = _offset;
     put32(_fp, 0x04034b50);
@@ -323,9 +357,124 @@ static BOOL extension_is_compressed(NSString *name) {
     // A file that changed while it was read must be recorded at the size that
     // actually went into the archive, or the central directory disagrees with
     // the local header.
-    [self appendCentralRecord:cname length:nameLen method:method crc:crc compressed:csize
+    [self appendCentralRecord:cname length:nameLen flags:0x0800 method:method crc:crc compressed:csize
                  uncompressed:readTotal offset:headerOffset time:dtime date:ddate dir:NO];
 
+    _entries++;
+    _bytes += readTotal;
+    return YES;
+}
+
+#pragma mark - streaming entry (no seeking)
+
+/// Writes one file with a trailing data descriptor so nothing has to be patched
+/// back in the header. Caller owns `in` (and closes it). Per-file ZIP64 is not
+/// attempted here — a single file >= 4 GiB is skipped; the archive total is
+/// still ZIP64 via the central directory and EOCD written at close.
+- (BOOL)streamFile:(FILE *)in
+              name:(const char *)cname
+            length:(size_t)nameLen
+             usize:(uint64_t)usize
+            method:(uint16_t)method
+             store:(BOOL)store
+              time:(uint16_t)dtime
+              date:(uint16_t)ddate
+             entry:(NSString *)entry {
+    // 16 MiB of headroom keeps the compressed size under 4 GiB even for an
+    // incompressible file near the limit, so a 32-bit descriptor is always safe.
+    if (usize >= (uint64_t)kMax32 - (16u << 20)) {
+        _skipped++;
+        return NO;
+    }
+
+    uint16_t flags = 0x0808;   // bit 11 UTF-8 + bit 3 data descriptor
+    uint64_t headerOffset = _offset;
+
+    put32(_fp, 0x04034b50);
+    put16(_fp, 20);            // version needed
+    put16(_fp, flags);
+    put16(_fp, method);
+    put16(_fp, dtime);
+    put16(_fp, ddate);
+    put32(_fp, 0);             // crc — in the data descriptor
+    put32(_fp, 0);             // compressed size — in the data descriptor
+    put32(_fp, 0);             // uncompressed size — in the data descriptor
+    put16(_fp, (uint16_t)nameLen);
+    put16(_fp, 0);             // extra length
+    fwrite(cname, 1, nameLen, _fp);
+    _offset += 30 + nameLen;
+
+    uint8_t *inBuf = malloc(kChunk);
+    uint8_t *outBuf = malloc(kChunk);
+    uint32_t crc = (uint32_t)crc32(0L, Z_NULL, 0);
+    uint64_t csize = 0;
+    uint64_t readTotal = 0;
+    BOOL ok = YES;
+
+    if (store) {
+        size_t n;
+        while ((n = fread(inBuf, 1, kChunk, in)) > 0) {
+            crc = (uint32_t)crc32(crc, inBuf, (uInt)n);
+            if (fwrite(inBuf, 1, n, _fp) != n) { ok = NO; break; }
+            csize += n;
+            readTotal += n;
+        }
+    } else {
+        z_stream zs;
+        memset(&zs, 0, sizeof(zs));
+        if (deflateInit2(&zs, Z_DEFAULT_COMPRESSION, Z_DEFLATED, -15, 8,
+                         Z_DEFAULT_STRATEGY) != Z_OK) {
+            ok = NO;
+        } else {
+            size_t n;
+            int rc = Z_OK;
+            while (ok && (n = fread(inBuf, 1, kChunk, in)) > 0) {
+                crc = (uint32_t)crc32(crc, inBuf, (uInt)n);
+                readTotal += n;
+                zs.next_in = inBuf;
+                zs.avail_in = (uInt)n;
+                while (zs.avail_in > 0) {
+                    zs.next_out = outBuf;
+                    zs.avail_out = (uInt)kChunk;
+                    if (deflate(&zs, Z_NO_FLUSH) == Z_STREAM_ERROR) { ok = NO; break; }
+                    size_t have = kChunk - zs.avail_out;
+                    if (have && fwrite(outBuf, 1, have, _fp) != have) { ok = NO; break; }
+                    csize += have;
+                }
+            }
+            while (ok) {
+                zs.next_out = outBuf;
+                zs.avail_out = (uInt)kChunk;
+                rc = deflate(&zs, Z_FINISH);
+                size_t have = kChunk - zs.avail_out;
+                if (have && fwrite(outBuf, 1, have, _fp) != have) { ok = NO; break; }
+                csize += have;
+                if (rc == Z_STREAM_END) break;
+                if (rc != Z_OK) { ok = NO; break; }
+            }
+            deflateEnd(&zs);
+        }
+    }
+
+    free(inBuf);
+    free(outBuf);
+
+    if (!ok) {
+        _error = [NSString stringWithFormat:@"write failed for %@: %s", entry, strerror(errno)];
+        _skipped++;
+        return NO;
+    }
+
+    // Data descriptor: signature, crc, compressed, uncompressed (32-bit each).
+    put32(_fp, 0x08074b50);
+    put32(_fp, crc);
+    put32(_fp, (uint32_t)csize);
+    put32(_fp, (uint32_t)readTotal);
+    _offset += 16;
+
+    [self appendCentralRecord:cname length:nameLen flags:flags method:method crc:crc
+                   compressed:csize uncompressed:readTotal offset:headerOffset
+                         time:dtime date:ddate dir:NO];
     _entries++;
     _bytes += readTotal;
     return YES;

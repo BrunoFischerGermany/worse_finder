@@ -13,6 +13,11 @@ NS_ASSUME_NONNULL_BEGIN
 
 + (nullable instancetype)writerAtPath:(NSString *)path;
 
+/// Writes the archive straight to a (non-seekable) file descriptor — a pipe or
+/// socket — using data descriptors instead of seeking back to patch headers.
+/// Lets the server stream a ZIP on the fly without staging it on disk.
++ (nullable instancetype)streamingWriterToFileDescriptor:(int)fd;
+
 - (BOOL)addDirectory:(NSString *)entry;
 - (BOOL)addFile:(NSString *)source entry:(NSString *)entry;
 - (BOOL)close;
