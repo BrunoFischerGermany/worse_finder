@@ -11,6 +11,7 @@ import Foundation
 import Network
 import Security
 import UIKit
+import Darwin
 
 // MARK: - password
 
@@ -258,6 +259,81 @@ private final class AuthState {
     }
 }
 
+/// One group/container path uploaded over the web UI.
+struct ImportedEntry: Codable, Hashable {
+    let label: String   // "App name · group.identifier"
+    let path: String    // /private/var/mobile/Containers/Shared/AppGroup/<uuid>
+}
+
+/// Paths pulled over USB (pymobiledevice3) and uploaded through the Import page.
+/// iOS < 27 cannot enumerate third-party App Groups on-device, so this is how
+/// their paths get in. Each upload replaces the set; persisted across launches.
+/// The entries are just a labelled, clickable index — browsing happens through
+/// the normal /a/<uuid> route, which resolves the path and grants access.
+final class ImportedPaths {
+    private var entries: [ImportedEntry] = []
+    private let lock = NSLock()
+
+    private var fileURL: URL {
+        let base = (try? FileManager.default.url(for: .applicationSupportDirectory,
+                                                 in: .userDomainMask, appropriateFor: nil, create: true))
+            ?? FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        return base.appendingPathComponent("imported_paths.json")
+    }
+
+    init() { load() }
+
+    func all() -> [ImportedEntry] { lock.lock(); defer { lock.unlock() }; return entries }
+
+    /// Accepts the full `pymobiledevice3 apps list` dump
+    /// ({ bundleID: { Container, GroupContainers, … } }) or the slim map
+    /// ({ bundleID: { groupID: path } }). Returns how many paths it took.
+    @discardableResult
+    func ingest(_ data: Data) -> Int {
+        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return 0 }
+        var parsed: [ImportedEntry] = []
+        for (bundleID, value) in root {
+            let dict = value as? [String: Any]
+            let name = ImportedPaths.clean((dict?["CFBundleDisplayName"] as? String)
+                                           ?? (dict?["CFBundleName"] as? String)) ?? bundleID
+            let groups = (dict?["GroupContainers"] as? [String: String])
+                ?? (value as? [String: String])   // slim format: the value *is* the group map
+                ?? [:]
+            for (identifier, path) in groups where path.hasPrefix("/") {
+                parsed.append(ImportedEntry(label: "\(name) · \(identifier)", path: path))
+            }
+            if let container = dict?["Container"] as? String, container.hasPrefix("/") {
+                parsed.append(ImportedEntry(label: "\(name) · container", path: container))
+            }
+        }
+        parsed.sort { $0.label.localizedCaseInsensitiveCompare($1.label) == .orderedAscending }
+        lock.lock(); entries = parsed; lock.unlock()
+        save()
+        return parsed.count
+    }
+
+    private func load() {
+        guard let data = try? Data(contentsOf: fileURL),
+              let decoded = try? JSONDecoder().decode([ImportedEntry].self, from: data) else { return }
+        entries = decoded
+    }
+
+    private func save() {
+        lock.lock(); let snapshot = entries; lock.unlock()
+        if let data = try? JSONEncoder().encode(snapshot) { try? data.write(to: fileURL) }
+    }
+
+    /// Store names carry bidi/formatting marks (WhatsApp ships a ‎).
+    private static func clean(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let trimmed = value
+            .replacingOccurrences(of: "\u{200e}", with: "")
+            .replacingOccurrences(of: "\u{200f}", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+}
+
 final class WebServer: ObservableObject {
     @Published private(set) var running = false
     @Published private(set) var log: [String] = []
@@ -273,6 +349,7 @@ final class WebServer: ObservableObject {
     private var iconCache: [String: Data] = [:]
     private let cacheLock = NSLock()
     private let auth = AuthState()
+    private let imported = ImportedPaths()
 
     var appsProvider: (() -> [AppEntry])?
 
@@ -382,15 +459,22 @@ final class WebServer: ObservableObject {
             }
 
             let head = String(decoding: buffer[..<range.lowerBound], as: UTF8.self)
+            // The import route carries a JSON map (the full pymobiledevice3 dump
+            // can be a few MB); every other request is tiny, so keep the strict
+            // cap for those.
+            let firstLine = head.split(separator: "\r\n").first.map(String.init) ?? ""
+            let isImport = firstLine.hasPrefix("POST /import ")
+            let maxBody = isImport ? 16 * 1024 * 1024 : 1024
+            let maxBuffer = isImport ? 17 * 1024 * 1024 : 64 * 1024
             let length = self.contentLength(head) ?? 0
-            if length < 0 || length > 1024 {
+            if length < 0 || length > maxBody {
                 slot.close()
                 self.send(connection, status: "400 Bad Request", body: Data("bad request".utf8))
                 return
             }
             let bodyStart = range.upperBound
             if buffer.distance(from: bodyStart, to: buffer.endIndex) < length {
-                if isComplete || error != nil || buffer.count > 64 * 1024 {
+                if isComplete || error != nil || buffer.count > maxBuffer {
                     slot.close()
                     connection.cancel()
                     return
@@ -420,6 +504,18 @@ final class WebServer: ObservableObject {
         if method == "POST" && path == "/login" {
             let submitted = formFields(body)["k"] ?? ""
             finish(connection, path: "/login", verdict: auth.verify(presented: submitted), login: true)
+            return
+        }
+        // Upload of the USB container map (raw JSON body). Same auth as the pages.
+        if method == "POST" && path == "/import" {
+            guard case .ok = auth.verify(presented: cookieJar(head)["wq"]) else {
+                send(connection, status: "401 Unauthorized", body: Data("auth required".utf8))
+                return
+            }
+            let count = imported.ingest(body)
+            note("import: \(count) paths")
+            send(connection, status: "200 OK",
+                 body: Data("imported \(count) paths — open them from the Apps page\n".utf8))
             return
         }
         guard method == "GET" else {
@@ -457,6 +553,12 @@ final class WebServer: ObservableObject {
         case "i":
             guard segments.count > 1 else { send(connection, status: "404 Not Found", body: Data()); return }
             sendIcon(connection, bundleID: segments[1])
+        case "import":
+            sendImportPage(connection)
+        case "all":
+            // One streamed ZIP of every reachable container, on the fly.
+            sendZipStream(connection, roots: allRoots(),
+                          filename: "worse_finder-all-\(Int(Date().timeIntervalSince1970)).zip")
         case "a", "f", "z":
             guard segments.count > 1 else { send(connection, status: "404 Not Found", body: Data()); return }
             let container = appContainer(for: segments[1])
@@ -469,7 +571,8 @@ final class WebServer: ObservableObject {
             switch segments[0] {
             case "a": sendListing(connection, container: container, relative: relative, group: group)
             case "f": sendFile(connection, container: container, relative: relative, group: group)
-            default: sendZip(connection, container: container)
+            default: sendZipStream(connection, roots: [(container, "")],
+                                   filename: safeFilename(appContainerName(container)) + ".zip")
             }
         default:
             send(connection, status: "404 Not Found", body: Data("not found".utf8))
@@ -540,12 +643,75 @@ final class WebServer: ObservableObject {
                 rows += "<div class=alt>+\(app.alternates.count) more container\(app.alternates.count == 1 ? "" : "s"): \(links)</div>"
             }
         }
+        let importedEntries = imported.all()
+        var importedSection = ""
+        if !importedEntries.isEmpty {
+            let links = importedEntries.map { entry in
+                """
+                <a class=row href="/a/\(entry.path.lastPathComponent)">
+                  <div class=ic></div>
+                  <div class=t><div class=n>\(entry.label.addingHTMLEntities())</div>
+                  <div class=s>\(String(entry.path.suffix(8)))</div></div>
+                  <div class=c>›</div>
+                </a>
+                """
+            }.joined()
+            importedSection = "<h1>Imported (\(importedEntries.count))</h1><div class=list>\(links)</div>"
+        }
         let body = """
         <h1>\(apps.count) apps</h1>
+        <div class=actions><a class=btn href="/all">Download all</a>
+          <a class=btn href="/import">Import map</a></div>
+        <form class=actions onsubmit="return openPath()">
+          <input id=pp placeholder="App Group path or UUID"
+                 autocapitalize=off autocorrect=off spellcheck=false>
+          <button class=btn type=submit>Open</button>
+        </form>
+        \(importedSection)
         <div class=list>\(rows)</div>
+        <script>
+        function openPath(){
+          var v=document.getElementById('pp').value.trim();
+          if(!v){return false}
+          // Accept a full /private/... path or a bare UUID; the server
+          // rebuilds the AppGroup path from the trailing UUID.
+          var id=v.split('/').filter(Boolean).pop();
+          location.href='/a/'+encodeURIComponent(id);
+          return false;
+        }
+        </script>
         """
         send(connection, status: "200 OK", type: "text/html; charset=utf-8",
              body: Data(page("Apps", body, home: true).utf8))
+    }
+
+    private func sendImportPage(_ connection: NWConnection) {
+        let count = imported.all().count
+        let body = """
+        <h1>Import container map</h1>
+        <p>Upload the JSON from <code>pymobiledevice3 apps list</code>, or a slim
+        <code>{ bundleID: { groupID: path } }</code> map. It fills in the App Group
+        paths that iOS &lt; 27 cannot enumerate on-device. Each upload replaces the set.</p>
+        <p>\(count) path\(count == 1 ? "" : "s") currently imported.</p>
+        <input type=file id=f accept="application/json,.json">
+        <div class=actions><button class=btn onclick="up()">Import</button>
+          <a class=btn href="/">Back to apps</a></div>
+        <pre id=out style="white-space:pre-wrap;color:#9aa4b2"></pre>
+        <script>
+        async function up(){
+          var el=document.getElementById('f');
+          if(!el.files.length){return}
+          var out=document.getElementById('out');
+          out.textContent='uploading…';
+          try{
+            var r=await fetch('/import',{method:'POST',body:await el.files[0].text()});
+            out.textContent=await r.text();
+          }catch(e){ out.textContent='failed: '+e; }
+        }
+        </script>
+        """
+        send(connection, status: "200 OK", type: "text/html; charset=utf-8",
+             body: Data(page("Import", body, home: true).utf8))
     }
 
     private func sendListing(_ connection: NWConnection, container: String, relative: String, group: String) {
@@ -679,44 +845,150 @@ final class WebServer: ObservableObject {
         if let cleanup { try? FileManager.default.removeItem(at: cleanup) }
     }
 
-    private func sendZip(_ connection: NWConnection, container: String) {
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("http-\(UUID().uuidString)", isDirectory: true)
-        let name = appContainerName(container)
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            guard let self else { return }
-            do {
-                let result = try Exporter().run(container: container, name: name,
-                                                outputDirectory: directory) { _, _ in }
-                let archive = (try? FileManager.default.attributesOfItem(atPath: result.url.path))?[.size] as? Int64 ?? 0
-                print("[export] \(container) files=\(result.files) bytes=\(result.bytes) skipped=\(result.skipped) archive=\(archive) seconds=\(String(format: "%.1f", result.seconds))")
-                self.serveArchive(connection, url: result.url)
-            } catch {
-                self.send(connection, status: "500 Internal Server Error", type: "text/html; charset=utf-8",
-                          body: Data(self.page("Export failed", "<p>\(error.localizedDescription)</p>", home: true).utf8))
-            }
-        }
-    }
-
-    private func serveArchive(_ connection: NWConnection, url: URL) {
-        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
-              let size = attributes[.size] as? Int64,
-              let stream = InputStream(url: url) else {
-            send(connection, status: "500 Internal Server Error", body: Data())
+    /// Streams a ZIP of one or more containers straight to the socket, built on
+    /// the fly: nothing is staged on disk first. A pipe connects a background
+    /// writer to the chunked HTTP sender and gives natural back-pressure — the
+    /// writer blocks whenever the reader has not drained it yet.
+    private func sendZipStream(_ connection: NWConnection,
+                               roots: [(path: String, prefix: String)],
+                               filename: String) {
+        guard wq_app_group() != nil else {
+            send(connection, status: "500 Internal Server Error", body: Data("no app group".utf8))
             return
         }
+        var fds: [Int32] = [0, 0]
+        guard pipe(&fds) == 0 else {
+            send(connection, status: "500 Internal Server Error", body: Data("pipe failed".utf8))
+            return
+        }
+        let readFD = fds[0]
+        let writeFD = fds[1]
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self, let group = wq_app_group(),
+                  let writer = ZipWriter.streamingWriter(toFileDescriptor: writeFD) else {
+                close(writeFD)
+                return
+            }
+            var files = 0
+            for root in roots {
+                files += self.streamRoot(root.path, prefix: root.prefix, group: group, writer: writer)
+            }
+            _ = writer.close()   // closes writeFD → EOF for the reader
+            print("[export-stream] \(filename) roots=\(roots.count) files=\(files) skipped=\(writer.filesSkipped)")
+        }
+
         let head = """
         HTTP/1.1 200 OK\r
         Content-Type: application/zip\r
-        Content-Length: \(size)\r
-        Content-Disposition: attachment; filename="\(url.lastPathComponent)"\r
+        Content-Disposition: attachment; filename="\(filename)"\r
+        Transfer-Encoding: chunked\r
         Connection: close\r
         \r
 
         """
-        connection.send(content: Data(head.utf8), completion: .contentProcessed { _ in })
-        stream.open()
-        // The archive is a temporary copy: drop it once it has been served.
-        pump(connection, stream: stream, handle: 0, cleanup: url.deletingLastPathComponent())
+        connection.send(content: Data(head.utf8), completion: .contentProcessed { [weak self] error in
+            if error != nil { close(readFD); connection.cancel(); return }
+            self?.queue.async { self?.pumpChunked(connection, fd: readFD) }
+        })
+    }
+
+    /// Reads one block from the pipe and sends it as a chunk; the next read only
+    /// happens once the send completes, which paces the whole transfer.
+    private func pumpChunked(_ connection: NWConnection, fd: Int32) {
+        let cap = 128 * 1024
+        var buffer = [UInt8](repeating: 0, count: cap)
+        let n = buffer.withUnsafeMutableBytes { rawBuffer in
+            Darwin.read(fd, rawBuffer.baseAddress, rawBuffer.count)
+        }
+        if n > 0 {
+            var out = Data(String(format: "%lX\r\n", n).utf8)
+            out.append(contentsOf: buffer[0..<n])
+            out.append(0x0d); out.append(0x0a)
+            connection.send(content: out, completion: .contentProcessed { [weak self] error in
+                if error != nil { close(fd); connection.cancel(); return }
+                self?.queue.async { self?.pumpChunked(connection, fd: fd) }
+            })
+        } else {
+            close(fd)
+            if n == 0 {
+                connection.send(content: Data("0\r\n\r\n".utf8),
+                                completion: .contentProcessed { _ in connection.cancel() })
+            } else {
+                print("[export-stream] read failed: \(errno)")
+                connection.cancel()
+            }
+        }
+    }
+
+    /// Walks one container into the writer, prefixing archive entries. Unreadable
+    /// or special files are skipped so one bad file never stops the stream.
+    @discardableResult
+    private func streamRoot(_ container: String, prefix: String, group: String, writer: ZipWriter) -> Int {
+        let handle = wq_grant(container, group, false)
+        guard handle >= 0 else { return 0 }
+        defer { wq_release(handle) }
+
+        func normalize(_ path: String) -> String {
+            path.hasPrefix("/private/") ? String(path.dropFirst(8)) : path
+        }
+        let base = normalize(container)
+
+        let root = URL(fileURLWithPath: container)
+        guard let enumerator = FileManager.default.enumerator(
+            at: root,
+            includingPropertiesForKeys: [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey],
+            options: [],
+            errorHandler: { _, _ in true }) else { return 0 }
+
+        var files = 0
+        for case let url as URL in enumerator {
+            var relative = normalize(url.path)
+            if relative.hasPrefix(base) { relative = String(relative.dropFirst(base.count)) }
+            relative = relative.hasPrefix("/") ? String(relative.dropFirst()) : relative
+            guard !relative.isEmpty else { continue }
+            let entry = prefix.isEmpty ? relative : prefix + "/" + relative
+
+            var info = stat()
+            guard lstat(url.path, &info) == 0 else { continue }
+            let kind = info.st_mode & S_IFMT
+            if kind == S_IFLNK { continue }
+            if kind == S_IFDIR { _ = writer.addDirectory(entry); continue }
+            guard kind == S_IFREG else { continue }
+            if writer.addFile(url.path, entry: entry) { files += 1 }
+        }
+        return files
+    }
+
+    /// Container names carry spaces, separators and non-ASCII; reduce to a safe
+    /// ASCII filename for the Content-Disposition header.
+    private func safeFilename(_ name: String) -> String {
+        let allowed = Set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.")
+        let cleaned = String(name.map { allowed.contains($0) ? $0 : "_" })
+            .trimmingCharacters(in: CharacterSet(charactersIn: "._"))
+        return cleaned.isEmpty ? "container" : cleaned
+    }
+
+    /// Every container the server can reach: each scanned app's data container,
+    /// its earlier-install containers and its App Groups, plus every uploaded
+    /// path. Each gets a unique archive prefix (label + UUID) so files from
+    /// different containers never collide. Unreachable roots contribute nothing
+    /// — streamRoot's grant simply fails and skips them.
+    private func allRoots() -> [(path: String, prefix: String)] {
+        var roots: [(path: String, prefix: String)] = []
+        var seen = Set<String>()
+        func add(_ path: String, _ label: String) {
+            guard !path.isEmpty, !seen.contains(path) else { return }
+            seen.insert(path)
+            roots.append((path, safeFilename(label) + "_" + path.lastPathComponent))
+        }
+        for app in appsProvider?() ?? [] {
+            add(app.container, app.displayName)
+            for alternate in app.alternates { add(alternate, app.displayName + "-earlier") }
+            for group in app.groups { add(group.path, app.displayName + "-" + group.identifier) }
+        }
+        for entry in imported.all() { add(entry.path, entry.label) }
+        return roots
     }
 
     private func sendIcon(_ connection: NWConnection, bundleID: String) {
@@ -759,7 +1031,17 @@ final class WebServer: ObservableObject {
     /// The row can go stale between scan and request: a reinstall replaces the
     /// container. Fall back to whatever LaunchServices reports now.
     private func appContainer(for identifier: String) -> String? {
-        guard let entry = containerIndex()[identifier] else { return nil }
+        guard let entry = containerIndex()[identifier] else {
+            // Not in the scan. Allow browsing a pasted App Group UUID directly:
+            // the path under Shared/AppGroup is deterministic, and the sandbox
+            // grant in sendListing/sendFile/sendZip is what actually validates
+            // access. This is what lets a single path reach a container the
+            // on-device scan could not enumerate (iOS < 27).
+            if UUID(uuidString: identifier) != nil {
+                return "/private/var/mobile/Containers/Shared/AppGroup/\(identifier)"
+            }
+            return nil
+        }
         var info = stat()
         if lstat(entry.path, &info) == 0 { return entry.path }
         if let bundleID = entry.bundleID, let fresh = wq_ls_container(bundleID) {

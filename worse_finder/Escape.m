@@ -110,7 +110,7 @@ static void remember_class(const char *token) {
     }
 }
 
-int64_t wq_grant(NSString *target, NSString *group, BOOL alt_flags) {
+static int64_t grant_once(NSString *target, NSString *group, BOOL alt_flags) {
     gLastError = nil;
     gLastClass = nil;
 
@@ -207,6 +207,18 @@ int64_t wq_grant(NSString *target, NSString *group, BOOL alt_flags) {
     dlclose(mgr);
     restore_caches(group);
     return handle;
+}
+
+/// The operation flags that containermanagerd needs differ by OS: the old
+/// default (1<<39) works through iOS 25, but iOS 26 refuses to issue a sandbox
+/// extension for App Group targets unless 1<<35 is set. Rather than sniff the
+/// version, try the caller's preferred flag and, on failure, fall back to the
+/// other — every caller then works across OS versions with no call-site change.
+/// `alt_flags` only chooses which flag is tried first.
+int64_t wq_grant(NSString *target, NSString *group, BOOL alt_flags) {
+    int64_t handle = grant_once(target, group, alt_flags);
+    if (handle >= 0) return handle;
+    return grant_once(target, group, !alt_flags);
 }
 
 void wq_release(int64_t handle) {
