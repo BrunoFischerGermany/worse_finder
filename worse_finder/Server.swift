@@ -271,7 +271,10 @@ struct ImportedEntry: Codable, Hashable {
 /// The entries are just a labelled, clickable index — browsing happens through
 /// the normal /a/<uuid> route, which resolves the path and grants access.
 final class ImportedPaths {
+    private struct Store: Codable { var entries: [ImportedEntry]; var names: [String: String] }
+
     private var entries: [ImportedEntry] = []
+    private var names: [String: String] = [:]   // bundleID -> CFBundleDisplayName
     private let lock = NSLock()
 
     private var fileURL: URL {
@@ -285,6 +288,14 @@ final class ImportedPaths {
 
     func all() -> [ImportedEntry] { lock.lock(); defer { lock.unlock() }; return entries }
 
+    /// The real display name the dump carries for a bundle, if any. The dump is
+    /// the authoritative source — on-device LaunchServices returns localized
+    /// UTType descriptions for many bundles instead of a name.
+    func name(for bundleID: String) -> String? {
+        lock.lock(); defer { lock.unlock() }
+        return names[bundleID]
+    }
+
     /// Accepts the full `pymobiledevice3 apps list` dump
     /// ({ bundleID: { Container, GroupContainers, … } }) or the slim map
     /// ({ bundleID: { groupID: path } }). Returns how many paths it took.
@@ -292,10 +303,13 @@ final class ImportedPaths {
     func ingest(_ data: Data) -> Int {
         guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return 0 }
         var parsed: [ImportedEntry] = []
+        var parsedNames: [String: String] = [:]
         for (bundleID, value) in root {
             let dict = value as? [String: Any]
-            let name = ImportedPaths.clean((dict?["CFBundleDisplayName"] as? String)
-                                           ?? (dict?["CFBundleName"] as? String)) ?? bundleID
+            let realName = ImportedPaths.clean((dict?["CFBundleDisplayName"] as? String)
+                                               ?? (dict?["CFBundleName"] as? String))
+            if let realName { parsedNames[bundleID] = realName }
+            let name = realName ?? bundleID
             let groups = (dict?["GroupContainers"] as? [String: String])
                 ?? (value as? [String: String])   // slim format: the value *is* the group map
                 ?? [:]
@@ -307,19 +321,23 @@ final class ImportedPaths {
             }
         }
         parsed.sort { $0.label.localizedCaseInsensitiveCompare($1.label) == .orderedAscending }
-        lock.lock(); entries = parsed; lock.unlock()
+        lock.lock(); entries = parsed; names = parsedNames; lock.unlock()
         save()
         return parsed.count
     }
 
     private func load() {
-        guard let data = try? Data(contentsOf: fileURL),
-              let decoded = try? JSONDecoder().decode([ImportedEntry].self, from: data) else { return }
-        entries = decoded
+        guard let data = try? Data(contentsOf: fileURL) else { return }
+        if let store = try? JSONDecoder().decode(Store.self, from: data) {
+            entries = store.entries
+            names = store.names
+        } else if let legacy = try? JSONDecoder().decode([ImportedEntry].self, from: data) {
+            entries = legacy   // older file written before names were stored
+        }
     }
 
     private func save() {
-        lock.lock(); let snapshot = entries; lock.unlock()
+        lock.lock(); let snapshot = Store(entries: entries, names: names); lock.unlock()
         if let data = try? JSONEncoder().encode(snapshot) { try? data.write(to: fileURL) }
     }
 
@@ -622,10 +640,14 @@ final class WebServer: ObservableObject {
             let icon = app.bundleID.map { "<img class=ic src=\"/i/\($0)\" loading=lazy>" }
                 ?? "<div class=ic></div>"
             let subtitle = app.subtitle.addingHTMLEntities()
+            // Prefer the name the uploaded dump carries — on-device LaunchServices
+            // returns localized UTType descriptions for many bundles.
+            let title = (app.bundleID.flatMap { imported.name(for: $0) } ?? app.displayName)
+                .addingHTMLEntities()
             rows += """
             <a class=row href="/a/\(app.container.lastPathComponent)">
               \(icon)
-              <div class=t><div class=n>\(app.displayName.addingHTMLEntities())</div>
+              <div class=t><div class=n>\(title)</div>
               <div class=s>\(subtitle)</div></div>
               <div class=c>›</div>
             </a>

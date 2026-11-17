@@ -82,6 +82,8 @@ final class Store: ObservableObject {
 
         queue.async {
             let started = Date()
+            // Authoritative names from the uploaded dump (if the user imported one).
+            let importedNames = Store.importedNames()
             guard let group = wq_app_group() else {
                 self.finish("no App Group — the app was signed without one")
                 return
@@ -127,7 +129,13 @@ final class Store: ObservableObject {
                     if let cached = resolved[bundleID] {
                         name = cached.isEmpty ? nil : cached
                     } else {
-                        name = Self.clean(wq_ls_name(bundleID)) ?? Self.clean(storeNames[bundleID])
+                        // LaunchServices returns localized UTType descriptions
+                        // ("MPEG-4 movie", "four-character code", each in a random
+                        // language) as the name for system helper bundles. For
+                        // those the bundle identifier is the useful label, so skip
+                        // the name and let displayName fall back to the bundleID.
+                        name = Self.clean(importedNames[bundleID])
+                            ?? (system ? nil : (Self.clean(wq_ls_name(bundleID)) ?? Self.clean(storeNames[bundleID])))
                         resolved[bundleID] = name ?? ""
                     }
                 }
@@ -183,26 +191,6 @@ final class Store: ObservableObject {
             let merged = extras.values.reduce(0) { $0 + $1.count }
             if merged > 0 { print("[scan] \(merged) extra live containers kept as alternates") }
 
-            // LaunchServices/store names for many system helper bundles are
-            // generic UTType descriptions ("MPEG-4 movie", "four-character code")
-            // shared across unrelated bundles. Drop any name used by more than
-            // one bundle so those fall back to the bundle identifier — the useful
-            // label. Real app names are unique and survive.
-            var bundlesByName: [String: Set<String>] = [:]
-            for entry in entries {
-                if let name = entry.name, let bundleID = entry.bundleID {
-                    bundlesByName[name, default: []].insert(bundleID)
-                }
-            }
-            var genericNames = 0
-            for index in entries.indices {
-                if let name = entries[index].name, (bundlesByName[name]?.count ?? 0) >= 2 {
-                    entries[index].name = nil
-                    genericNames += 1
-                }
-            }
-            if genericNames > 0 { print("[scan] dropped \(genericNames) generic shared names") }
-
             entries.sort {
                 $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending
             }
@@ -257,6 +245,20 @@ final class Store: ObservableObject {
 
     private static func clean(_ value: String?) -> String? {
         value.flatMap(AppEntry.sanitize)
+    }
+
+    /// Display names from the dump uploaded through the web Import page, keyed by
+    /// bundleID. The server (ImportedPaths) writes imported_paths.json; the scan
+    /// reads it so the on-device list shows real names too — on-device
+    /// LaunchServices only returns localized UTType descriptions for most bundles.
+    private static func importedNames() -> [String: String] {
+        let base = (try? FileManager.default.url(for: .applicationSupportDirectory,
+                                                 in: .userDomainMask, appropriateFor: nil, create: false))
+            ?? FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
+        guard let url = base?.appendingPathComponent("imported_paths.json"),
+              let data = try? Data(contentsOf: url) else { return [:] }
+        struct Payload: Decodable { var names: [String: String]? }
+        return (try? JSONDecoder().decode(Payload.self, from: data))?.names ?? [:]
     }
 
     // MARK: - LaunchServices store
